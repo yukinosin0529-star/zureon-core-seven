@@ -1,3 +1,4 @@
+[🇯🇵 日本語](./README.md) | [🌍 English](./README_en.md)
 # 🌌 ZUREON Core Seven — Deviation Recursive Dynamics Prototype
 
 > **「ズレこそ、存在の証」**  
