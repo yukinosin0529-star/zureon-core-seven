@@ -1,0 +1,1208 @@
+1. pubspec.yaml
+
+name: zureon_omega
+description: 心のズレを優しく教えてくれるアプリ - Zureon Ω
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.5.1
+  fl_chart: ^0.68.0
+  shared_preferences: ^2.2.2
+  # 将来 ESVM-Ω 推論APIとつなぐため
+  http: ^1.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  # TorchScript をアプリ内に同梱したくなったらここを使う
+  # assets:
+  #   - assets/esvm_omega.pt
+
+
+⸻
+
+2. lib/main.dart
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'screens/home_screen.dart';
+
+void main() {
+  runApp(const ProviderScope(child: ZureonOmegaApp()));
+}
+
+class ZureonOmegaApp extends StatelessWidget {
+  const ZureonOmegaApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Zureon Ω',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+
+⸻
+
+3. lib/screens/home_screen.dart
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../widgets/stress_gauge.dart';
+import '../widgets/status_card.dart';
+import '../widgets/subjective_slider.dart';
+import '../providers/esvm_provider.dart';
+
+class HomeScreen extends ConsumerWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // FutureProvider として ESVMビューを監視
+    final esvmViewAsync = ref.watch(esvmSimpleViewProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Zureon Ω',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+      ),
+      body: esvmViewAsync.when(
+        // ローディング時
+        loading: () => const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('負荷を計算中...', style: TextStyle(fontSize: 16)),
+            ],
+          ),
+        ),
+        // エラー時
+        error: (err, stack) => Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32.0),
+            child: Text(
+              '計算エラーが発生しました:\n$err',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.red),
+            ),
+          ),
+        ),
+        // 正常時
+        data: (view) {
+          // Mapの中身を一旦ローカル変数に展開（?[] が使えないため）
+          final stressMap =
+              view['stress'] as Map<String, dynamic>? ?? <String, dynamic>{};
+          final inconsistencyMap =
+              view['inconsistency'] as Map<String, dynamic>? ??
+                  <String, dynamic>{};
+          final futureMap =
+              view['future'] as Map<String, dynamic>? ?? <String, dynamic>{};
+          final stateMap =
+              view['state'] as Map<String, dynamic>? ?? <String, dynamic>{};
+
+          final int stressScore = (stressMap['score'] ?? 0) as int;
+          final int inconsistencyScore =
+              (inconsistencyMap['score'] ?? 0) as int;
+          final int futureScore = (futureMap['score'] ?? 0) as int;
+          final int stateRaw = (stateMap['raw'] ?? 0) as int;
+
+          final String stressLabel = (stressMap['label'] ?? '') as String;
+          final String inconsistencyLabel =
+              (inconsistencyMap['label'] ?? '') as String;
+          final String futureLabel = (futureMap['label'] ?? '') as String;
+          final String stateLabel =
+              (stateMap['label'] ?? '読み込み中...') as String;
+
+          final String stressColorHex =
+              (stressMap['color'] ?? '#FFD600') as String;
+          final String inconsistencyColorHex =
+              (inconsistencyMap['color'] ?? '#FFD600') as String;
+          final String futureColorHex =
+              (futureMap['color'] ?? '#FFD600') as String;
+
+          final stressColor = Color(
+            int.parse(stressColorHex.replaceFirst('#', '0xFF')),
+          );
+          final inconsistencyColor = Color(
+            int.parse(inconsistencyColorHex.replaceFirst('#', '0xFF')),
+          );
+          final futureColor = Color(
+            int.parse(futureColorHex.replaceFirst('#', '0xFF')),
+          );
+
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: [
+                // 大きな円形ゲージ
+                StressGauge(score: stressScore),
+
+                const SizedBox(height: 30),
+
+                // 全体状態テキスト
+                Text(
+                  stateLabel,
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+
+                const SizedBox(height: 40),
+
+                // 4つのカード
+                GridView.count(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 16,
+                  mainAxisSpacing: 16,
+                  childAspectRatio: 1.6,
+                  children: [
+                    StatusCard(
+                      title: "今のしんどさ",
+                      score: stressScore,
+                      label: stressLabel,
+                      color: stressColor,
+                    ),
+                    StatusCard(
+                      title: "心と体のズレ",
+                      score: inconsistencyScore,
+                      label: inconsistencyLabel,
+                      color: inconsistencyColor,
+                    ),
+                    StatusCard(
+                      title: "30秒後の予測",
+                      score: futureScore,
+                      label: futureLabel,
+                      color: futureColor,
+                    ),
+                    StatusCard(
+                      title: "全体状態",
+                      // raw を 0〜4 → 0〜40 にして「なんとなく数値」感だけ出す
+                      score: stateRaw * 10,
+                      label: stateLabel,
+                      color: Colors.deepPurple,
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 40),
+
+                // 主観スライダー
+                const Text(
+                  "今のしんどさを教えてね",
+                  style: TextStyle(fontSize: 18),
+                ),
+                const SizedBox(height: 10),
+                const SubjectiveSlider(),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+
+⸻
+
+4. lib/widgets/stress_gauge.dart
+
+import 'package:flutter/material.dart';
+import 'dart:math' as math;
+
+class StressGauge extends StatelessWidget {
+  final int score; // 0-100
+
+  const StressGauge({super.key, required this.score});
+
+  @override
+  Widget build(BuildContext context) {
+    // clamp は num を返すので toDouble() してから割る
+    final double value = score.clamp(0, 100).toDouble() / 100.0;
+
+    Color gaugeColor;
+    if (value < 0.25) {
+      gaugeColor = const Color(0xFF00C853); // かなり余裕
+    } else if (value < 0.5) {
+      gaugeColor = const Color(0xFFFFD600); // ふつう
+    } else if (value < 0.75) {
+      gaugeColor = const Color(0xFFFF9100); // ちょっとしんどい
+    } else {
+      gaugeColor = const Color(0xFFD50000); // かなりしんどい
+    }
+
+    return SizedBox(
+      width: 220,
+      height: 220,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 200,
+            height: 200,
+            child: CircularProgressIndicator(
+              value: value,
+              strokeWidth: 16,
+              backgroundColor: Colors.grey[300],
+              valueColor: AlwaysStoppedAnimation(gaugeColor),
+            ),
+          ),
+          // 目盛り
+          Transform.rotate(
+            angle: -math.pi / 2,
+            child: CustomPaint(
+              size: const Size(200, 200),
+              painter: _GaugeTickPainter(),
+            ),
+          ),
+          // 中央の数値表示
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$score',
+                style: const TextStyle(
+                  fontSize: 48,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Text(
+                'しんどさ',
+                style: TextStyle(fontSize: 16),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GaugeTickPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    const radius = 90.0;
+
+    final paint = Paint()
+      ..color = Colors.grey[400]!
+      ..strokeWidth = 2;
+
+    for (int i = 0; i < 40; i++) {
+      final angle = i * 9 * math.pi / 180; // 40 * 9° = 360°
+      final bool isLong = i % 5 == 0;
+      final double innerR = radius - (isLong ? 15.0 : 8.0);
+      const double outerR = radius;
+
+      final start = Offset(
+        center.dx + innerR * math.cos(angle),
+        center.dy + innerR * math.sin(angle),
+      );
+      final end = Offset(
+        center.dx + outerR * math.cos(angle),
+        center.dy + outerR * math.sin(angle),
+      );
+      canvas.drawLine(start, end, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+
+⸻
+
+5. lib/widgets/status_card.dart
+
+import 'package:flutter/material.dart';
+
+class StatusCard extends StatelessWidget {
+  final String title;
+  final int score;
+  final String label;
+  final Color color;
+
+  const StatusCard({
+    super.key,
+    required this.title,
+    required this.score,
+    required this.label,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              fontSize: 14,
+              color: Colors.grey,
+            ),
+          ),
+          const SizedBox(height: 8),
+          if (score > 0)
+            Text(
+              '$score',
+              style: TextStyle(
+                fontSize: 32,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          const SizedBox(height: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              color: color,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+⸻
+
+6. lib/widgets/subjective_slider.dart
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/esvm_provider.dart';
+
+class SubjectiveSlider extends ConsumerWidget {
+  const SubjectiveSlider({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final subjective = ref.watch(subjectiveProvider);
+
+    return Column(
+      children: [
+        Slider(
+          value: subjective,
+          min: 0,
+          max: 100,
+          divisions: 100,
+          label: subjective.round().toString(),
+          onChanged: (v) {
+            // 主観値更新 & ESVM再計算トリガー
+            ref.read(esvmProcessorProvider.notifier).updateSubjective(v);
+          },
+        ),
+        Text(
+          '主観しんどさ: ${subjective.round()}',
+          style: const TextStyle(fontSize: 16),
+        ),
+      ],
+    );
+  }
+}
+
+
+⸻
+
+7. lib/providers/esvm_provider.dart
+
+import 'dart:async';
+import 'dart:math';
+import 'dart:convert';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
+
+/// 主観スライダー（0〜100）
+final subjectiveProvider = StateProvider<double>((ref) => 50.0);
+
+// 将来、ESVM-Ω 推論APIを立てたときに使う想定URL
+const _inferenceApiUrl = 'http://localhost:8080/api/infer';
+
+/// ESVMのシンプルビュー（UI用）
+/// - 今はダミーで `_createDummyView`
+/// - 将来は↑のAPIを叩いて結果をViewに変換
+final esvmSimpleViewProvider =
+    FutureProvider<Map<String, Map<String, dynamic>>>((ref) async {
+  final subjective = ref.watch(subjectiveProvider);
+
+  // ───────── 実運用時：API呼び出し（今はコメントアウト） ─────────
+  /*
+  try {
+    final payload = {
+      'physio': [ /* ここに 30秒分の生理データ配列 */ ],
+      'action': [ /* 30秒分の行動データ */ ],
+      'spectrum': [ /* 30秒分のスペクトラムデータ */ ],
+      'subjective': subjective.round(), // 主観値(0-100)
+    };
+
+    final response = await http.post(
+      Uri.parse(_inferenceApiUrl),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode(payload),
+    );
+
+    if (response.statusCode == 200) {
+      final jsonResult = json.decode(response.body) as Map<String, dynamic>;
+      // 本番ではここで ESVM-Ω の生出力 → UI用マップ に変換する
+      // return convertEsvmRawToView(jsonResult);
+
+      // ひとまず API がそのまま UI用形式を返す前提にもできる
+      return jsonResult.map(
+        (key, value) =>
+            MapEntry(key, (value as Map).cast<String, dynamic>()),
+      );
+    } else {
+      throw Exception('API推論エラー: ${response.statusCode}');
+    }
+  } catch (e) {
+    print('推論失敗: $e');
+    // APIエラー時はダミーにフォールバック
+    return _createDummyView(subjective);
+  }
+  */
+
+  // ───────── 開発・デモ用：ダミー計算 ─────────
+  await Future.delayed(const Duration(milliseconds: 300)); // ちょっと待たせて「計算中」感
+  return _createDummyView(subjective);
+});
+
+/// ダミーデータを生成する関数
+Map<String, Map<String, dynamic>> _createDummyView(double subjective) {
+  final rng = Random();
+
+  // 主観に少しノイズを足して“リアルっぽく”
+  final baseStress = subjective + rng.nextDouble() * 20 - 10;
+  final stress = baseStress.clamp(0.0, 100.0);
+
+  final inconsistency =
+      (rng.nextDouble() * 40 + (subjective - stress).abs() * 0.5)
+          .clamp(0.0, 100.0);
+
+  final future = (stress + rng.nextDouble() * 30).clamp(0.0, 100.0);
+
+  // しんどさラベル & 色
+  late String stressLabel;
+  late String stressColor;
+  if (stress < 25) {
+    stressLabel = "かなり余裕";
+    stressColor = "#00C853";
+  } else if (stress < 50) {
+    stressLabel = "ふつう";
+    stressColor = "#FFD600";
+  } else if (stress < 75) {
+    stressLabel = "ちょっとしんどい";
+    stressColor = "#FF9100";
+  } else {
+    stressLabel = "かなりしんどい";
+    stressColor = "#D50000";
+  }
+
+  // ズレラベル & 色
+  final inconsNorm = inconsistency / 100.0;
+  late String inconsLabel;
+  late String inconsColor;
+  if (inconsNorm < 0.25) {
+    inconsLabel = "自覚と身体はだいたい一致";
+    inconsColor = "#00C853";
+  } else if (inconsNorm < 0.5) {
+    inconsLabel = "ちょっとズレてる";
+    inconsColor = "#FFD600";
+  } else if (inconsNorm < 0.75) {
+    inconsLabel = "けっこうズレてる";
+    inconsColor = "#FF9100";
+  } else {
+    inconsLabel = "かなりズレが大きい";
+    inconsColor = "#D50000";
+  }
+
+  // 未来予測ラベル & 色
+  late String futureLabel;
+  late String futureColor;
+  if (future < 30) {
+    futureLabel = "このままでも大丈夫そう";
+    futureColor = "#00C853";
+  } else if (future < 70) {
+    futureLabel = "このペースが続くと重くなりそう";
+    futureColor = "#FFD600";
+  } else {
+    futureLabel = "このままはキツいかも";
+    futureColor = "#D50000";
+  }
+
+  // 全体状態
+  final stateIdx =
+      ((stress / 25.0).floor()).clamp(0, 4).toInt(); // 0〜4 にクリップ
+  const stateLabels = [
+    "かなり余裕",
+    "ふつう",
+    "じわ疲れ",
+    "しんどいゾーン",
+    "限界手前",
+  ];
+
+  return {
+    "state": {
+      "raw": stateIdx,
+      "label": stateLabels[stateIdx],
+    },
+    "stress": {
+      "score": stress.round(),
+      "color": stressColor,
+      "label": stressLabel,
+    },
+    "inconsistency": {
+      "score": inconsistency.round(),
+      "color": inconsColor,
+      "label": inconsLabel,
+    },
+    "future": {
+      "score": future.round(),
+      "color": futureColor,
+      "label": futureLabel,
+    },
+  };
+}
+
+/// ESVM “処理器”
+/// - 1秒ごとに FutureProvider を再実行して「ちょっと揺れる」感じを出す
+final esvmProcessorProvider =
+    StateNotifierProvider<ProcessorNotifier, int>((ref) {
+  return ProcessorNotifier(ref);
+});
+
+class ProcessorNotifier extends StateNotifier<int> {
+  ProcessorNotifier(this.ref) : super(0) {
+    _startTimer();
+  }
+
+  final Ref ref;
+
+  void _startTimer() async {
+    while (ref.mounted) {
+      await Future.delayed(const Duration(seconds: 1));
+      // 状態を少しだけ更新（UIでは使わなくてOK）
+      state++;
+      ref.invalidate(esvmSimpleViewProvider);
+    }
+  }
+
+  /// 主観値の更新（スライダーから呼ばれる）
+  void updateSubjective(double value) {
+    ref.read(subjectiveProvider.notifier).state = value;
+    state++; // 変更トリガーとして増やしておく
+    ref.invalidate(esvmSimpleViewProvider);
+  }
+}
+
+
+⸻
+
+8. Python バックエンド（そのまま保存しておく用）
+
+これは Flutter からはまだ呼んでないけど、
+backend/esvm_omega_v2_2.py みたいな名前で置いておけば OK なやつ。
+君が貼ってくれた ESVM-Omega v2.2 は一切いじってないよ。
+
+# ESVM-Omega v2.2 - Fixed MVP Implementation + Simple View Helper
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TimeStabilityLayer(nn.Module):
+    """
+    時系列安定性層（TSL）
+    - 入力: [T, 4] （H1〜H4の系列）
+    - Conv1d で軽く時間平滑化
+    """
+    def __init__(self, kernel_size: int = 5):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            4, 4, kernel_size=kernel_size,
+            padding=padding, bias=False
+        )
+        with torch.no_grad():
+            # 全チャネル同一カーネル（簡易平均フィルタ）
+            self.conv.weight.fill_(1.0 / kernel_size)
+
+    def forward(self, H_stack: torch.Tensor) -> torch.Tensor:
+        # H_stack: [T, 4] -> [1, 4, T] -> [T, 4]
+        H = H_stack.transpose(0, 1).unsqueeze(0)   # [1,4,T]
+        H_smooth = self.conv(H)                    # [1,4,T]
+        return H_smooth.squeeze(0).transpose(0, 1) # [T,4]
+
+
+class GaussianSmoothing1D(nn.Module):
+    """
+    1次元ガウシアン平滑（弱微分用）
+    - 入力: [L] → 出力: [L]
+    """
+    def __init__(self, kernel_size: int = 7, sigma: float = 1.5):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=kernel_size,
+            padding=padding, bias=False
+        )
+
+        # ガウシアンカーネルで初期化
+        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        with torch.no_grad():
+            self.conv.weight.copy_(kernel.view(1, 1, -1))
+
+        for p in self.parameters():
+            p.requires_grad = False  # 固定カーネル
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [L] → [1,1,L] → conv → [L]
+        x_ = x.view(1, 1, -1)
+        y = self.conv(x_)
+        return y.view(-1)
+
+
+class InconsistencyIndex(nn.Module):
+    """
+    不一致指数 II
+    II = |H1-H2| + |H1-H3| + |H2-H3| + |H4-(H1+H2+H3)/3|
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, H1, H2, H3, H4):
+        avg_phys = (H1 + H2 + H3) / 3.0
+        ii = (H1 - H2).abs() \
+           + (H1 - H3).abs() \
+           + (H2 - H3).abs() \
+           + (H4 - avg_phys).abs()
+        return ii.mean()
+
+
+class SubjectiveTrustLayer(nn.Module):
+    """
+    主観信頼度 w(t)
+    w(t) = exp( - (diff(t)^2) / (2 * sigma^2) )
+    diff: 主観 vs 生理平均の差
+    - 入力: H4, H_phys_mean → [T]
+    - 出力: w_series: [T] （0〜1）
+    """
+    def __init__(self, sigma: float = 0.25):
+        super().__init__()
+        self.sigma2 = sigma ** 2
+
+    def forward(self, H4, H_phys_mean):
+        diff = H4 - H_phys_mean
+        w = torch.exp(- (diff ** 2) / (2 * self.sigma2))
+        w = torch.clamp(w, 0.0, 1.0)
+        return w  # [T]
+
+
+class FutureDriftPredictor(nn.Module):
+    """
+    Future Drift Predictor (FDP)
+    - 直近の軌道 + 最終変化率 + 安定性 → 30秒後の負荷予測
+    """
+    def __init__(self, hidden_dim: int = 16):
+        super().__init__()
+        self.fc1 = nn.Linear(6, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        traj_tail: torch.Tensor,
+        last_dH_dt: torch.Tensor,
+        stability: torch.Tensor
+    ):
+        last_state = traj_tail[-1]           # [4]
+        x = torch.cat([
+            last_state.view(-1),             # 4
+            last_dH_dt.view(-1),             # 1
+            stability.view(-1)               # 1
+        ], dim=0)                            # [6]
+        h = torch.tanh(self.fc1(x))
+        pred = torch.sigmoid(self.fc2(h))    # 0〜1
+        return pred.squeeze()
+
+
+class StateMachine5(nn.Module):
+    """
+    5状態分類機構
+    0: Calm
+    1: Normal
+    2: Latent Stress
+    3: Active Stress
+    4: Critical
+    """
+    def __init__(self):
+        super().__init__()
+        self.th_calm = 0.20
+        self.th_normal = 0.35
+        self.th_latent = 0.55
+        self.th_active = 0.75
+        self.ii_latent_boost = 0.15
+
+    def forward(self, H_final, II, stability):
+        load = H_final
+        adj_load = load + torch.clamp(II, 0, 1) * self.ii_latent_boost
+
+        # CPU float に落として if 文まわりを単純化
+        load_val = float(adj_load.item())
+        ii_val = float(II.item())
+        stab_val = float(stability.item())
+
+        if load_val < self.th_calm:
+            state = 0  # Calm
+        elif load_val < self.th_normal:
+            state = 1  # Normal
+        elif load_val < self.th_latent:
+            state = 2  # Latent Stress
+        elif load_val < self.th_active:
+            state = 3  # Active Stress
+        else:
+            if ii_val > 0.5 and stab_val < 0.3:
+                state = 4
+            else:
+                state = 3
+
+        latent_score = adj_load
+        return state, latent_score
+
+
+class HypothesisHead(nn.Module):
+    """
+    各仮説 H1〜H3 用ヘッド
+    入力: [T, F] → 出力: [T]（0〜1）
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = 16):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = torch.tanh(self.fc1(z))
+        out = torch.sigmoid(self.fc2(h)).squeeze(-1)  # [T]
+        return out
+
+
+class ESVM_Omega(nn.Module):
+    """
+    ESVM-Ω 完全統合版（修正版）
+    """
+    def __init__(
+        self,
+        physio_dim=4,
+        action_dim=4,
+        spectrum_dim=4,
+        window_sec=30,
+        fs=30,
+        future_sec=30
+    ):
+        super().__init__()
+        self.window = window_sec * fs
+        self.future = future_sec * fs
+
+        # 個人ベースライン
+        self.register_buffer('B_phys', torch.zeros(physio_dim))
+        self.register_buffer('MAD_phys', torch.ones(physio_dim))
+        self.register_buffer('B_act', torch.zeros(action_dim))
+        self.register_buffer('MAD_act', torch.ones(action_dim))
+        self.register_buffer('B_spec', torch.zeros(spectrum_dim))
+        self.register_buffer('MAD_spec', torch.ones(spectrum_dim))
+        self.alpha = 0.001  # ベースライン追従速度
+
+        # R(t) のスカラー基準
+        self.register_buffer('R_scalar', torch.zeros(1))
+
+        # メタ認知コスト / 感情ダイナミクス内部状態
+        self.register_buffer('C_m_state', torch.zeros(1))
+        self.register_buffer('E_dyn', torch.zeros(1))
+
+        # 仮説ヘッド
+        self.h_phys = HypothesisHead(physio_dim)
+        self.h_act = HypothesisHead(action_dim)
+        self.h_spec = HypothesisHead(spectrum_dim)
+
+        # 8層構造コンポーネント
+        self.tsl = TimeStabilityLayer()
+        self.ii = InconsistencyIndex()
+        self.w_t = SubjectiveTrustLayer()
+        self.fdp = FutureDriftPredictor()
+        self.state_machine = StateMachine5()
+        self.gauss = GaussianSmoothing1D(kernel_size=7, sigma=1.5)
+
+        # ESVM-Ω ハイパーパラメータ
+        self.a_plus = 1.0
+        self.a_minus = 2.0
+        self.p_plus = 1.0
+        self.p_minus = 1.0
+        self.b_vel = 1.0
+
+        self.kappa_time = 1.0
+        self.gamma_time = 1.0
+
+        self.alpha_band = 1.0
+        self.B_max = 0.6
+        self.beta_band = 2.0
+
+        self.lambda_meta = 1.0
+        self.meta_decay = 0.99
+
+        self.phi1 = 1.0
+        self.phi2 = 0.5
+        self.phi3 = 0.2
+        self.phi4 = 0.8
+        self.dt = 1.0 / fs
+
+    # ===== 内部状態リセット =====
+    def reset_internal_state(self):
+        """
+        R_scalar, C_m_state, E_dyn を明示的に初期化したいとき用。
+        学習・オンライン推定切り替え時などに呼ぶ。
+        """
+        with torch.no_grad():
+            self.R_scalar.zero_()
+            self.C_m_state.zero_()
+            self.E_dyn.zero_()
+
+    # ===== ベースライン更新 & ロバストz =====
+    def update_baseline_phys(self, x_raw: torch.Tensor):
+        """
+        x_raw: [Fp]
+        MAD は「更新前のベースラインとの差」で計算するように調整。
+        """
+        with torch.no_grad():
+            # 旧ベースラインとの差を使う
+            dev = (x_raw - self.B_phys).abs()
+            self.B_phys.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_phys.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def update_baseline_act(self, x_raw: torch.Tensor):
+        with torch.no_grad():
+            dev = (x_raw - self.B_act).abs()
+            self.B_act.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_act.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def update_baseline_spec(self, x_raw: torch.Tensor):
+        with torch.no_grad():
+            dev = (x_raw - self.B_spec).abs()
+            self.B_spec.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_spec.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def robust_z_phys(self, x: torch.Tensor):
+        return (x - self.B_phys) / (1.4826 * self.MAD_phys + 1e-8)
+
+    def robust_z_act(self, x: torch.Tensor):
+        return (x - self.B_act) / (1.4826 * self.MAD_act + 1e-8)
+
+    def robust_z_spec(self, x: torch.Tensor):
+        return (x - self.B_spec) / (1.4826 * self.MAD_spec + 1e-8)
+
+    # ===== main forward =====
+    def forward(self, physio, action, spectrum, subjective):
+        """
+        physio    : [T, Fp]
+        action    : [T, Fa]
+        spectrum  : [T, Fs]
+        subjective: [T] または [1] （0〜100）
+        """
+        T = physio.size(0)
+        device = physio.device
+        dtype = physio.dtype
+
+        # 安全ガード：T=0 の場合は全部ゼロ返し
+        if T == 0:
+            zero = physio.new_tensor(0.0)
+            return {
+                'state': 0,
+                'latent_stress': zero,
+                'inconsistency': zero,
+                'trust_subjective': zero,
+                'predict_30s': zero,
+                'final_load': zero,
+                'stability': zero,
+                'V_omega': zero,
+                'E_dyn': self.E_dyn.to(device=device, dtype=dtype),
+            }
+
+        # 1) ロバストz変換
+        z_p = self.robust_z_phys(physio)     # [T, Fp]
+        z_a = self.robust_z_act(action)      # [T, Fa]
+        z_s = self.robust_z_spec(spectrum)   # [T, Fs]
+
+        # 2) 多仮説推定 H1〜H3
+        H1 = self.h_phys(z_p)                # [T]
+        H2 = self.h_act(z_a)                 # [T]
+        H3 = self.h_spec(z_s)                # [T]
+
+        # 主観 H4（0〜1）
+        if subjective.numel() == 1:
+            H4 = subjective.view(1).expand(T).to(
+                device=device, dtype=dtype
+            ) / 100.0
+        else:
+            H4 = subjective.view(T).to(
+                device=device, dtype=dtype
+            ) / 100.0
+
+        # 3) 時系列層 TSL
+        H_stack = torch.stack([H1, H2, H3, H4], dim=-1)  # [T,4]
+        traj = self.tsl(H_stack)                         # [T,4]
+
+        # 4) 変化率・安定性
+        if T > 2:
+            dH_dt = traj[1:] - traj[:-1]                # [T-1,4]
+            dH_dt_abs = dH_dt.abs().mean(-1)            # [T-1]
+            dH_dt_last = dH_dt_abs[-1]                  # ()
+            d2H_dt2 = dH_dt[1:] - dH_dt[:-1]            # [T-2,4]
+            _ = d2H_dt2.abs().mean(-1)
+        else:
+            dH_dt_last = physio.new_tensor(0.0)
+            dH_dt_abs = physio.new_zeros(max(T - 1, 1))
+
+        stability = traj.std(0).mean()                  # ()
+
+        # 5) 不一致指数 II
+        II = self.ii(H1, H2, H3, H4)                    # ()
+
+        # 6) 主観信頼度 w(t) [T]
+        phys_mean_series = (H1 + H2 + H3) / 3.0
+        w_series = self.w_t(H4, phys_mean_series)       # [T]
+        w_mean = w_series.mean()                        # 代表値として平均も保持
+
+        # 7) 統合推定値（0〜1）
+        H_final_series = (
+            w_series * H4
+            + (1.0 - w_series) * phys_mean_series
+        )                                              # [T]
+        H_final = H_final_series.mean()               # ()
+
+        # 8) 未来予測 FDP
+        tail_len = min(T, int(self.future))
+        traj_tail = traj[-tail_len:]
+        pred_30s = self.fdp(traj_tail, dH_dt_last, stability)
+
+        # ======== ここから ESVM-Ω 理論パート ========
+
+        # Deviation D(t) = H_final_series - R_scalar
+        with torch.no_grad():
+            self.R_scalar.mul_(1.0 - self.alpha).add_(
+                self.alpha * H_final.detach()
+            )
+
+        D_series = H_final_series - self.R_scalar  # [T]
+        absD = D_series.abs()
+
+        # 主観時間密度 ρ(t) の最後の値
+        if T > 1:
+            d_absD = absD[1:] - absD[:-1]            # [T-1]
+            d_absD_last = d_absD[-1]
+        else:
+            d_absD_last = physio.new_tensor(0.0)
+
+        rho_last = 1.0 + self.kappa_time * (
+            d_absD_last.abs() ** self.gamma_time
+        )
+
+        # 非対称価値 V_dev^Ω
+        D_last = D_series[-1]
+        D_plus = torch.clamp(D_last, min=0.0)
+        D_minus = torch.clamp(D_last, max=0.0)  # <=0
+
+        f_plus = self.a_plus * (D_plus ** self.p_plus)
+        f_minus = - self.a_minus * ((-D_minus) ** self.p_minus)
+
+        if T > 1:
+            vel = dH_dt_abs[-1]
+        else:
+            vel = physio.new_tensor(0.0)
+        g_vel = torch.clamp(self.b_vel * vel, min=0.0)
+
+        V_dev = (f_plus + f_minus) * g_vel  # スカラー
+
+        # 感情帯域モデル
+        E_series = (H4 - 0.5) * 2.0         # [-1,1]
+        E_last = E_series[-1].abs()
+        band_term = torch.clamp(
+            E_last - self.B_max, min=0.0
+        ) ** self.beta_band
+        V_band = self.alpha_band * band_term * rho_last
+
+        # メタ認知コスト
+        if T > 3:
+            Ddiff = D_series[1:] - D_series[:-1]           # [T-1]
+            Ddiff_smooth = self.gauss(Ddiff)               # [T-1]
+            curvature = Ddiff_smooth[1:] - Ddiff_smooth[:-1]  # [T-2]
+            curv_mean = curvature.abs().mean()
+        else:
+            curv_mean = physio.new_tensor(0.0)
+
+        with torch.no_grad():
+            self.C_m_state.mul_(self.meta_decay).add_(
+                (1.0 - self.meta_decay) * curv_mean.detach()
+            )
+
+        V_meta = self.lambda_meta * self.C_m_state.squeeze()
+
+        # ESVM-Ω の総合出力
+        V_omega = V_dev + V_band + V_meta
+
+        # 感情ダイナミクス ODE (内部状態 E_dyn)
+        with torch.no_grad():
+            absD_last = absD[-1]
+            dE = (
+                self.phi1 * V_omega.detach()
+                + self.phi2 * absD_last.detach()
+                + self.phi3 * rho_last.detach()
+                - self.phi4 * self.E_dyn
+            )
+            self.E_dyn.add_(self.dt * dE)
+
+        # 9) 5状態分類
+        state, latent_score = self.state_machine(H_final, II, stability)
+
+        return {
+            'state': state,                              # 0:Calm ~ 4:Critical（int）
+            'latent_stress': latent_score,               # Tensor
+            'inconsistency': II,                         # Tensor
+            'trust_subjective': w_mean,                  # w(t) の平均
+            'predict_30s': pred_30s,                     # Tensor 0〜1
+            'final_load': H_final,                       # Tensor 0〜1
+            'stability': stability,                      # Tensor
+            'V_omega': V_omega,                          # ESVM-Ω価値
+            'E_dyn': self.E_dyn.to(device=device, dtype=dtype),  # 内部感情状態
+        }
+
+
+# =========================
+# 素人向け UI 変換ヘルパ
+# =========================
+
+def esvm_to_simple_view(out: dict) -> dict:
+    """
+    ESVM_Omega の生アウトプット(dict) → 素人向け UI 用の
+    「数値＋色＋短いラベル」に変換する。
+    """
+
+    # 1) 今の負荷レベル
+    s = float(out["latent_stress"].item())  # 0〜1 想定
+    s = max(0.0, min(s, 1.0))
+    stress_score = round(s * 100)
+
+    if s < 0.25:
+        stress_color = "#00C853"
+        stress_label = "かなり余裕"
+    elif s < 0.50:
+        stress_color = "#FFD600"
+        stress_label = "ふつう"
+    elif s < 0.75:
+        stress_color = "#FF9100"
+        stress_label = "ちょっとしんどい"
+    else:
+        stress_color = "#D50000"
+        stress_label = "かなりしんどい"
+
+    # 2) ズレレベル（身体 vs 主観）
+    II = float(out["inconsistency"].item())
+    # 0〜2 を 0〜1 に圧縮してクリップ（2 以上は全部 100 扱い）
+    norm_incons = max(0.0, min(II / 2.0, 1.0))
+    incons_score = round(norm_incons * 100)
+
+    if norm_incons < 0.25:
+        incons_color = "#00C853"
+        incons_label = "自覚と身体はだいたい一致"
+    elif norm_incons < 0.50:
+        incons_color = "#FFD600"
+        incons_label = "ちょっとズレてる"
+    elif norm_incons < 0.75:
+        incons_color = "#FF9100"
+        incons_label = "けっこうズレてる"
+    else:
+        incons_color = "#D50000"
+        incons_label = "かなりズレが大きい"
+
+    # 3) 30秒後のしんどさ予測
+    f = float(out["predict_30s"].item())  # 0〜1
+    f = max(0.0, min(f, 1.0))
+    future_score = round(f * 100)
+
+    if f < 0.30:
+        future_color = "#00C853"
+        future_label = "このままでも大丈夫そう"
+    elif f < 0.70:
+        future_color = "#FFD600"
+        future_label = "このペースが続くと重くなりそう"
+    else:
+        future_color = "#D50000"
+        future_label = "このままはキツいかも"
+
+    # 4) state を人間語に
+    state = int(out["state"])
+    state_labels = ["かなり余裕", "ふつう", "じわ疲れ", "しんどいゾーン", "限界手前"]
+    if 0 <= state < len(state_labels):
+        state_label = state_labels[state]
+    else:
+        state_label = "不明"
+
+    return {
+        "state": {
+            "raw": state,
+            "label": state_label,
+        },
+        "stress": {
+            "score": stress_score,   # 0〜100
+            "color": stress_color,
+            "label": stress_label,
+        },
+        "inconsistency": {
+            "score": incons_score,   # 0〜100
+            "color": incons_color,
+            "label": incons_label,
+        },
+        "future": {
+            "score": future_score,   # 0〜100
+            "color": future_color,
+            "label": future_label,
+        },
+    }
