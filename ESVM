@@ -1,0 +1,772 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TimeStabilityLayer(nn.Module):
+    """
+    時系列安定性層（TSL）
+    - 入力: [T, 4] （H1〜H4の系列）
+    - Conv1d で軽く時間平滑化
+    """
+    def __init__(self, kernel_size: int = 5):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            4, 4, kernel_size=kernel_size,
+            padding=padding, bias=False
+        )
+        with torch.no_grad():
+            # 全チャネル同一カーネル（簡易平均フィルタ）
+            self.conv.weight.fill_(1.0 / kernel_size)
+
+    def forward(self, H_stack: torch.Tensor) -> torch.Tensor:
+        # H_stack: [T, 4] -> [1, 4, T] -> Conv1d -> [T, 4]
+        H = H_stack.transpose(0, 1).unsqueeze(0)   # [1,4,T]
+        H_smooth = self.conv(H)                    # [1,4,T]
+        return H_smooth.squeeze(0).transpose(0, 1) # [T,4]
+
+
+class GaussianSmoothing1D(nn.Module):
+    """
+    1次元ガウシアン平滑（弱微分用）
+    - 入力: [L] → 出力: [L]
+    """
+    def __init__(self, kernel_size: int = 7, sigma: float = 1.5):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=kernel_size,
+            padding=padding, bias=False
+        )
+
+        # ガウシアンカーネルで初期化
+        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        with torch.no_grad():
+            self.conv.weight.copy_(kernel.view(1, 1, -1))
+
+        for p in self.parameters():
+            p.requires_grad = False  # 固定カーネル
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [L] → [1,1,L] → conv → [L]
+        x_ = x.view(1, 1, -1)
+        y = self.conv(x_)
+        return y.view(-1)
+
+
+class InconsistencyIndex(nn.Module):
+    """
+    不一致指数 II
+    II = |H1-H2| + |H1-H3| + |H2-H3| + |H4-(H1+H2+H3)/3|
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, H1, H2, H3, H4):
+        avg_phys = (H1 + H2 + H3) / 3.0
+        ii = (H1 - H2).abs() \
+           + (H1 - H3).abs() \
+           + (H2 - H3).abs() \
+           + (H4 - avg_phys).abs()
+        return ii.mean()
+
+
+class SubjectiveTrustLayer(nn.Module):
+    """
+    主観信頼度 w(t) 強化版
+    - 非対称ガウス（過小申告に厳しく）
+    - 下限 w_min
+    - 時間方向の EMA 慣性
+    入力: H4, H_phys_mean → [T]
+    出力: w_series: [T] （0〜1）
+    """
+    def __init__(
+        self,
+        sigma_up: float = 0.25,
+        sigma_down: float = 0.15,
+        w_min: float = 0.2,
+        beta: float = 0.1,
+    ):
+        super().__init__()
+        self.sigma_up = sigma_up
+        self.sigma_down = sigma_down
+        self.w_min = w_min
+        self.beta = beta
+
+        # w(0) = 1 からスタート（最初は主観をフル信用）
+        self.register_buffer('w_prev', torch.ones(1))
+
+    def forward(self, H4, H_phys_mean):
+        # diff: 主観 − 身体平均
+        diff = H4 - H_phys_mean  # [T]
+
+        # 非対称ガウス
+        w_raw = torch.empty_like(diff)
+        mask_pos = diff >= 0
+
+        # 主観高め側（やや緩め）
+        w_raw[mask_pos] = torch.exp(
+            - (diff[mask_pos] ** 2) / (2 * self.sigma_up ** 2)
+        )
+        # 過小申告側（厳しめ）
+        w_raw[~mask_pos] = torch.exp(
+            - (diff[~mask_pos] ** 2) / (2 * self.sigma_down ** 2)
+        )
+
+        # 下限 w_min を入れる
+        w_clamp = self.w_min + (1.0 - self.w_min) * w_raw  # [T]
+
+        # 時間方向 EMA
+        T = diff.shape[0]
+        w_series = torch.empty_like(diff)
+
+        w_prev = self.w_prev.to(device=diff.device, dtype=diff.dtype)
+        beta = self.beta
+
+        for k in range(T):
+            w_prev = (1.0 - beta) * w_prev + beta * w_clamp[k]
+            w_series[k] = w_prev
+
+        # 次回に繋ぐ
+        with torch.no_grad():
+            self.w_prev.copy_(w_prev.detach())
+
+        return w_series  # [T]
+
+
+class FutureDriftPredictor(nn.Module):
+    """
+    Future Drift Predictor (FDP)
+    - 直近の軌道 + 最終変化率 + 安定性 → 30秒後の負荷予測
+    """
+    def __init__(self, hidden_dim: int = 16):
+        super().__init__()
+        self.fc1 = nn.Linear(6, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        traj_tail: torch.Tensor,
+        last_dH_dt: torch.Tensor,
+        stability: torch.Tensor
+    ):
+        last_state = traj_tail[-1]           # [4]
+        x = torch.cat([
+            last_state.view(-1),             # 4
+            last_dH_dt.view(-1),             # 1
+            stability.view(-1)               # 1
+        ], dim=0)                            # [6]
+        h = torch.tanh(self.fc1(x))
+        pred = torch.sigmoid(self.fc2(h))    # 0〜1
+        return pred.squeeze()
+
+
+class StateMachine5(nn.Module):
+    """
+    5状態分類機構
+    0: Calm
+    1: Normal
+    2: Latent Stress
+    3: Active Stress
+    4: Critical
+    """
+    def __init__(self):
+        super().__init__()
+        self.th_calm = 0.20
+        self.th_normal = 0.35
+        self.th_latent = 0.55
+        self.th_active = 0.75
+        self.ii_latent_boost = 0.15
+
+    def forward(self, H_final, II, stability):
+        load = H_final
+        adj_load = load + torch.clamp(II, 0, 1) * self.ii_latent_boost
+
+        # CPU float に落として if 文まわりを単純化
+        load_val = float(adj_load.item())
+        ii_val = float(II.item())
+        stab_val = float(stability.item())
+
+        if load_val < self.th_calm:
+            state = 0  # Calm
+        elif load_val < self.th_normal:
+            state = 1  # Normal
+        elif load_val < self.th_latent:
+            state = 2  # Latent Stress
+        elif load_val < self.th_active:
+            state = 3  # Active Stress
+        else:
+            if ii_val > 0.5 and stab_val < 0.3:
+                state = 4
+            else:
+                state = 3
+
+        latent_score = adj_load
+        return state, latent_score
+
+
+class HypothesisHead(nn.Module):
+    """
+    各仮説 H1〜H3 用ヘッド
+    入力: [T, F] → 出力: [T]（0〜1）
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = 16):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = torch.tanh(self.fc1(z))
+        out = torch.sigmoid(self.fc2(h)).squeeze(-1)  # [T]
+        return out
+
+
+class DRDBridge(nn.Module):
+    """
+    ESVM の H1〜H4 を DRD の簡易時間力学に落とすブリッジ。
+    - 主観 H4 を基準に、I_phys/I_act/I_spec を学習
+    - ズレの大きさ φ から内部エネルギー E_drd を更新
+    """
+    def __init__(
+        self,
+        dt: float = 1.0 / 30.0,
+        alpha_drd: float = 1.0,
+        beta_drd: float = 0.5,
+        gamma_drd: float = 0.1,
+    ):
+        super().__init__()
+        self.dt = dt
+        self.alpha_drd = alpha_drd
+        self.beta_drd = beta_drd
+        self.gamma_drd = gamma_drd
+
+        self.register_buffer('I_phys', torch.zeros(1))
+        self.register_buffer('I_act', torch.zeros(1))
+        self.register_buffer('I_spec', torch.zeros(1))
+        self.register_buffer('E_drd', torch.zeros(1))
+
+        self._initialized = False
+
+    def reset_state(self):
+        with torch.no_grad():
+            self.I_phys.zero_()
+            self.I_act.zero_()
+            self.I_spec.zero_()
+            self.E_drd.zero_()
+        self._initialized = False
+
+    def forward(self, H1, H2, H3, H4):
+        """
+        H1,H2,H3,H4: [T] （0〜1）
+        戻り値:
+          E_drd: 最終エネルギー（スカラー Tensor）
+          phi_last: 最終時刻のズレ大きさ（スカラー Tensor）
+          I_phys, I_act, I_spec: 更新後の理想値（各スカラー Tensor）
+        """
+        T = H1.shape[0]
+        device = H1.device
+        dtype = H1.dtype
+
+        if T == 0:
+            # 念のため
+            return (
+                self.E_drd.to(device=device, dtype=dtype),
+                torch.zeros((), device=device, dtype=dtype),
+                self.I_phys.to(device=device, dtype=dtype),
+                self.I_act.to(device=device, dtype=dtype),
+                self.I_spec.to(device=device, dtype=dtype),
+            )
+
+        # 初期化：最初だけ主観 H4 の先頭に揃える
+        if not self._initialized:
+            init_val = H4[0].detach()
+            with torch.no_grad():
+                self.I_phys.fill_(float(init_val))
+                self.I_act.fill_(float(init_val))
+                self.I_spec.fill_(float(init_val))
+                self.E_drd.zero_()
+            self._initialized = True
+
+        I_phys = self.I_phys.to(device=device, dtype=dtype)
+        I_act = self.I_act.to(device=device, dtype=dtype)
+        I_spec = self.I_spec.to(device=device, dtype=dtype)
+        E = self.E_drd.to(device=device, dtype=dtype)
+
+        dt = self.dt
+        alpha = self.alpha_drd
+        beta = self.beta_drd
+        gamma = self.gamma_drd
+
+        phi_last = torch.zeros((), device=device, dtype=dtype)
+
+        for k in range(T):
+            # 主観側の理想 I_4(k) は常に H4(k) と同じにするので
+            # ズレは 1〜3成分だけ見る
+            delta1 = H1[k] - I_phys
+            delta2 = H2[k] - I_act
+            delta3 = H3[k] - I_spec
+
+            # ズレの大きさ φ(k)
+            phi = torch.sqrt(delta1 ** 2 + delta2 ** 2 + delta3 ** 2)
+            phi_last = phi
+
+            # エネルギー更新
+            E = E + dt * (alpha * phi - beta * E)
+
+            # 理想側の更新（tanh でクリップ）
+            I_phys = I_phys + dt * gamma * torch.tanh(delta1)
+            I_act = I_act + dt * gamma * torch.tanh(delta2)
+            I_spec = I_spec + dt * gamma * torch.tanh(delta3)
+
+        # バッファ更新
+        with torch.no_grad():
+            self.I_phys.copy_(I_phys.detach())
+            self.I_act.copy_(I_act.detach())
+            self.I_spec.copy_(I_spec.detach())
+            self.E_drd.copy_(E.detach())
+
+        return E, phi_last, I_phys, I_act, I_spec
+
+
+class ESVM_Omega(nn.Module):
+    """
+    ESVM-Ω 完全統合版（修正版 + DRD ブリッジ）
+    """
+    def __init__(
+        self,
+        physio_dim=4,
+        action_dim=4,
+        spectrum_dim=4,
+        window_sec=30,
+        fs=30,
+        future_sec=30
+    ):
+        super().__init__()
+        self.window = window_sec * fs
+        self.future = future_sec * fs
+        self.fs = fs
+        self.dt = 1.0 / fs
+
+        # 個人ベースライン
+        self.register_buffer('B_phys', torch.zeros(physio_dim))
+        self.register_buffer('MAD_phys', torch.ones(physio_dim))
+        self.register_buffer('B_act', torch.zeros(action_dim))
+        self.register_buffer('MAD_act', torch.ones(action_dim))
+        self.register_buffer('B_spec', torch.zeros(spectrum_dim))
+        self.register_buffer('MAD_spec', torch.ones(spectrum_dim))
+        self.alpha = 0.001  # ベースライン追従速度
+
+        # R(t) のスカラー基準
+        self.register_buffer('R_scalar', torch.zeros(1))
+
+        # メタ認知コスト / 感情ダイナミクス内部状態
+        self.register_buffer('C_m_state', torch.zeros(1))
+        self.register_buffer('E_dyn', torch.zeros(1))
+
+        # 仮説ヘッド
+        self.h_phys = HypothesisHead(physio_dim)
+        self.h_act = HypothesisHead(action_dim)
+        self.h_spec = HypothesisHead(spectrum_dim)
+
+        # 8層構造コンポーネント + DRD ブリッジ
+        self.tsl = TimeStabilityLayer()
+        self.ii = InconsistencyIndex()
+        self.w_t = SubjectiveTrustLayer()
+        self.fdp = FutureDriftPredictor()
+        self.state_machine = StateMachine5()
+        self.gauss = GaussianSmoothing1D(kernel_size=7, sigma=1.5)
+        self.drd = DRDBridge(dt=self.dt)
+
+        # ESVM-Ω ハイパーパラメータ
+        self.a_plus = 1.0
+        self.a_minus = 2.0
+        self.p_plus = 1.0
+        self.p_minus = 1.0
+        self.b_vel = 1.0
+
+        self.kappa_time = 1.0
+        self.gamma_time = 1.0
+
+        self.alpha_band = 1.0
+        self.B_max = 0.6
+        self.beta_band = 2.0
+
+        self.lambda_meta = 1.0
+        self.meta_decay = 0.99
+
+        self.phi1 = 1.0
+        self.phi2 = 0.5
+        self.phi3 = 0.2
+        self.phi4 = 0.8
+
+    # ===== 内部状態リセット =====
+    def reset_internal_state(self):
+        """
+        R_scalar, C_m_state, E_dyn, DRD ブリッジを初期化。
+        """
+        with torch.no_grad():
+            self.R_scalar.zero_()
+            self.C_m_state.zero_()
+            self.E_dyn.zero_()
+        self.drd.reset_state()
+
+    # ===== ベースライン更新 & ロバストz =====
+    def update_baseline_phys(self, x_raw: torch.Tensor):
+        """
+        x_raw: [Fp]
+        MAD は「更新前のベースラインとの差」で計算。
+        """
+        with torch.no_grad():
+            dev = (x_raw - self.B_phys).abs()
+            self.B_phys.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_phys.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def update_baseline_act(self, x_raw: torch.Tensor):
+        with torch.no_grad():
+            dev = (x_raw - self.B_act).abs()
+            self.B_act.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_act.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def update_baseline_spec(self, x_raw: torch.Tensor):
+        with torch.no_grad():
+            dev = (x_raw - self.B_spec).abs()
+            self.B_spec.mul_(1.0 - self.alpha).add_(self.alpha * x_raw)
+            self.MAD_spec.mul_(1.0 - self.alpha).add_(self.alpha * dev)
+
+    def robust_z_phys(self, x: torch.Tensor):
+        return (x - self.B_phys) / (1.4826 * self.MAD_phys + 1e-8)
+
+    def robust_z_act(self, x: torch.Tensor):
+        return (x - self.B_act) / (1.4826 * self.MAD_act + 1e-8)
+
+    def robust_z_spec(self, x: torch.Tensor):
+        return (x - self.B_spec) / (1.4826 * self.MAD_spec + 1e-8)
+
+    # ===== main forward =====
+    def forward(self, physio, action, spectrum, subjective):
+        """
+        physio    : [T, Fp]
+        action    : [T, Fa]
+        spectrum  : [T, Fs]
+        subjective: [T] または [1] （0〜100）
+        """
+        T = physio.size(0)
+        device = physio.device
+        dtype = physio.dtype
+
+        # 安全ガード：T=0 の場合は全部ゼロ返し
+        if T == 0:
+            zero = physio.new_tensor(0.0)
+            return {
+                'state': 0,
+                'latent_stress': zero,
+                'inconsistency': zero,
+                'trust_subjective': zero,
+                'predict_30s': zero,
+                'final_load': zero,
+                'stability': zero,
+                'V_omega': zero,
+                'E_dyn': self.E_dyn.to(device=device, dtype=dtype),
+                'speed_mean': zero,
+                'jerk_mean': zero,
+                'E_drd': self.drd.E_drd.to(device=device, dtype=dtype),
+                'phi_last': zero,
+                'I_phys': self.drd.I_phys.to(device=device, dtype=dtype),
+                'I_act': self.drd.I_act.to(device=device, dtype=dtype),
+                'I_spec': self.drd.I_spec.to(device=device, dtype=dtype),
+            }
+
+        # 1) ロバストz変換
+        z_p = self.robust_z_phys(physio)     # [T, Fp]
+        z_a = self.robust_z_act(action)      # [T, Fa]
+        z_s = self.robust_z_spec(spectrum)   # [T, Fs]
+
+        # 2) 多仮説推定 H1〜H3
+        H1 = self.h_phys(z_p)                # [T]
+        H2 = self.h_act(z_a)                 # [T]
+        H3 = self.h_spec(z_s)                # [T]
+
+        # 主観 H4（0〜1）
+        if subjective.numel() == 1:
+            H4 = subjective.view(1).expand(T).to(
+                device=device, dtype=dtype
+            ) / 100.0
+        else:
+            H4 = subjective.view(T).to(
+                device=device, dtype=dtype
+            ) / 100.0
+
+        # 3) 時系列層 TSL
+        H_stack = torch.stack([H1, H2, H3, H4], dim=-1)  # [T,4]
+        traj = self.tsl(H_stack)                         # [T,4]
+
+        # 4) 変化率・安定性 ＋ H1〜H3 の速度・揺れ指標
+        if T > 2:
+            dH_dt = traj[1:] - traj[:-1]                # [T-1,4]
+            dH_dt_abs = dH_dt.abs().mean(-1)            # [T-1]
+            dH_dt_last = dH_dt_abs[-1]                  # ()
+
+            d2H_dt2 = dH_dt[1:] - dH_dt[:-1]            # [T-2,4]
+
+            # 1〜3成分だけで速度・揺れを計算
+            v123 = dH_dt[:, :3] / self.dt               # [T-1,3]
+            V_speed = torch.linalg.norm(v123, dim=-1)   # [T-1]
+            V_speed_mean = V_speed.mean()
+
+            a123 = d2H_dt2[:, :3] / (self.dt ** 2)      # [T-2,3]
+            A_jerk = torch.linalg.norm(a123, dim=-1)    # [T-2]
+            A_jerk_mean = A_jerk.mean()
+        elif T == 2:
+            dH_dt = traj[1:] - traj[:-1]                # [1,4]
+            dH_dt_abs = dH_dt.abs().mean(-1)            # [1]
+            dH_dt_last = dH_dt_abs[-1]
+
+            v123 = dH_dt[:, :3] / self.dt               # [1,3]
+            V_speed_mean = torch.linalg.norm(v123, dim=-1).mean()
+
+            A_jerk_mean = physio.new_tensor(0.0)
+        else:  # T == 1
+            dH_dt_last = physio.new_tensor(0.0)
+            dH_dt_abs = physio.new_zeros(1)
+            V_speed_mean = physio.new_tensor(0.0)
+            A_jerk_mean = physio.new_tensor(0.0)
+
+        stability = traj.std(0).mean()                  # ()
+
+        # 5) 不一致指数 II
+        II = self.ii(H1, H2, H3, H4)                    # ()
+
+        # 6) 主観信頼度 w(t) [T]
+        phys_mean_series = (H1 + H2 + H3) / 3.0
+        w_series = self.w_t(H4, phys_mean_series)       # [T]
+        w_mean = w_series.mean()                        # 代表値として平均も保持
+
+        # 7) 統合推定値（0〜1）
+        H_final_series = (
+            w_series * H4
+            + (1.0 - w_series) * phys_mean_series
+        )                                               # [T]
+        H_final = H_final_series.mean()                 # ()
+
+        # 8) 未来予測 FDP
+        tail_len = min(T, int(self.future))
+        traj_tail = traj[-tail_len:]
+        pred_30s = self.fdp(traj_tail, dH_dt_last, stability)
+
+        # ======== ここから ESVM-Ω 理論パート ========
+
+        # Deviation D(t) = H_final_series - R_scalar
+        with torch.no_grad():
+            self.R_scalar.mul_(1.0 - self.alpha).add_(
+                self.alpha * H_final.detach()
+            )
+
+        D_series = H_final_series - self.R_scalar  # [T]
+        absD = D_series.abs()
+
+        # 主観時間密度 ρ(t) の最後の値
+        if T > 1:
+            d_absD = absD[1:] - absD[:-1]            # [T-1]
+            d_absD_last = d_absD[-1]
+        else:
+            d_absD_last = physio.new_tensor(0.0)
+
+        rho_last = 1.0 + self.kappa_time * (
+            d_absD_last.abs() ** self.gamma_time
+        )
+
+        # 非対称価値 V_dev^Ω
+        D_last = D_series[-1]
+        D_plus = torch.clamp(D_last, min=0.0)
+        D_minus = torch.clamp(D_last, max=0.0)  # <=0
+
+        f_plus = self.a_plus * (D_plus ** self.p_plus)
+        f_minus = - self.a_minus * ((-D_minus) ** self.p_minus)
+
+        if T > 1:
+            vel = dH_dt_abs[-1]
+        else:
+            vel = physio.new_tensor(0.0)
+        g_vel = torch.clamp(self.b_vel * vel, min=0.0)
+
+        V_dev = (f_plus + f_minus) * g_vel  # スカラー
+
+        # 感情帯域モデル
+        E_series = (H4 - 0.5) * 2.0         # [-1,1]
+        E_last = E_series[-1].abs()
+        band_term = torch.clamp(
+            E_last - self.B_max, min=0.0
+        ) ** self.beta_band
+        V_band = self.alpha_band * band_term * rho_last
+
+        # メタ認知コスト
+        if T > 3:
+            Ddiff = D_series[1:] - D_series[:-1]               # [T-1]
+            Ddiff_smooth = self.gauss(Ddiff)                   # [T-1]
+            curvature = Ddiff_smooth[1:] - Ddiff_smooth[:-1]   # [T-2]
+            curv_mean = curvature.abs().mean()
+        else:
+            curv_mean = physio.new_tensor(0.0)
+
+        with torch.no_grad():
+            self.C_m_state.mul_(self.meta_decay).add_(
+                (1.0 - self.meta_decay) * curv_mean.detach()
+            )
+
+        V_meta = self.lambda_meta * self.C_m_state.squeeze()
+
+        # ESVM-Ω の総合出力
+        V_omega = V_dev + V_band + V_meta
+
+        # 感情ダイナミクス ODE (内部状態 E_dyn)
+        with torch.no_grad():
+            absD_last = absD[-1]
+            dE = (
+                self.phi1 * V_omega.detach()
+                + self.phi2 * absD_last.detach()
+                + self.phi3 * rho_last.detach()
+                - self.phi4 * self.E_dyn
+            )
+            self.E_dyn.add_(self.dt * dE)
+
+        # ======== DRD ブリッジ部分 ========
+        # TSL で平滑化した H から DRD 用 H1〜H4 を取り出す
+        H1_s = traj[:, 0]
+        H2_s = traj[:, 1]
+        H3_s = traj[:, 2]
+        H4_s = traj[:, 3]
+
+        E_drd, phi_last, I_phys, I_act, I_spec = self.drd(H1_s, H2_s, H3_s, H4_s)
+
+        # 9) 5状態分類
+        state, latent_score = self.state_machine(H_final, II, stability)
+
+        return {
+            'state': state,                              # 0:Calm ~ 4:Critical（int）
+            'latent_stress': latent_score,               # Tensor (0〜1程度)
+            'inconsistency': II,                         # Tensor
+            'trust_subjective': w_mean,                  # w(t) の平均
+            'predict_30s': pred_30s,                     # Tensor 0〜1
+            'final_load': H_final,                       # Tensor 0〜1
+            'stability': stability,                      # Tensor
+            'V_omega': V_omega,                          # ESVM-Ω価値
+            'E_dyn': self.E_dyn.to(device=device, dtype=dtype),  # 内部感情状態
+            'speed_mean': V_speed_mean,                  # H1〜H3 の速度指標
+            'jerk_mean': A_jerk_mean,                    # H1〜H3 の揺れ指標
+            'E_drd': E_drd,                              # DRD 内部エネルギー
+            'phi_last': phi_last,                        # 最終時刻のズレ大きさ
+            'I_phys': I_phys,                            # 理想生理負荷
+            'I_act': I_act,                              # 理想行動負荷
+            'I_spec': I_spec,                            # 理想スペクトル負荷
+        }
+
+
+# =========================
+# 素人向け UI 変換ヘルパ
+# =========================
+
+def esvm_to_simple_view(out: dict) -> dict:
+    """
+    ESVM_Omega の生アウトプット(dict) → 素人向け UI 用の
+    「数値＋色＋短いラベル」に変換する。
+
+    戻り値の例:
+    {
+        "state": { "raw": 2, "label": "じわ疲れ" },
+        "stress": {
+            "score": 68, "color": "#FF9100", "label": "ちょっとしんどい"
+        },
+        "inconsistency": {
+            "score": 40, "color": "#FFD600", "label": "ちょっとズレてる"
+        },
+        "future": {
+            "score": 55, "color": "#FFD600",
+            "label": "このペースが続くと重くなりそう"
+        }
+    }
+    """
+
+    # 1) 今の負荷レベル
+    s = float(out["latent_stress"].item())  # 0〜1 想定
+    s = max(0.0, min(s, 1.0))
+    stress_score = round(s * 100)
+
+    if s < 0.25:
+        stress_color = "#00C853"
+        stress_label = "かなり余裕"
+    elif s < 0.50:
+        stress_color = "#FFD600"
+        stress_label = "ふつう"
+    elif s < 0.75:
+        stress_color = "#FF9100"
+        stress_label = "ちょっとしんどい"
+    else:
+        stress_color = "#D50000"
+        stress_label = "かなりしんどい"
+
+    # 2) ズレレベル（身体 vs 主観）
+    II = float(out["inconsistency"].item())
+    # 0〜2 を 0〜1 に圧縮してクリップ（2 以上は全部 100 扱い）
+    norm_incons = max(0.0, min(II / 2.0, 1.0))
+    incons_score = round(norm_incons * 100)
+
+    if norm_incons < 0.25:
+        incons_color = "#00C853"
+        incons_label = "自覚と身体はだいたい一致"
+    elif norm_incons < 0.50:
+        incons_color = "#FFD600"
+        incons_label = "ちょっとズレてる"
+    elif norm_incons < 0.75:
+        incons_color = "#FF9100"
+        incons_label = "けっこうズレてる"
+    else:
+        incons_color = "#D50000"
+        incons_label = "かなりズレが大きい"
+
+    # 3) 30秒後のしんどさ予測
+    f = float(out["predict_30s"].item())  # 0〜1
+    f = max(0.0, min(f, 1.0))
+    future_score = round(f * 100)
+
+    if f < 0.30:
+        future_color = "#00C853"
+        future_label = "このままでも大丈夫そう"
+    elif f < 0.70:
+        future_color = "#FFD600"
+        future_label = "このペースが続くと重くなりそう"
+    else:
+        future_color = "#D50000"
+        future_label = "このままはキツいかも"
+
+    # 4) state を人間語に
+    state = int(out["state"])
+    state_labels = ["かなり余裕", "ふつう", "じわ疲れ", "しんどいゾーン", "限界手前"]
+    if 0 <= state < len(state_labels):
+        state_label = state_labels[state]
+    else:
+        state_label = "不明"
+
+    return {
+        "state": {
+            "raw": state,
+            "label": state_label,
+        },
+        "stress": {
+            "score": stress_score,   # 0〜100
+            "color": stress_color,
+            "label": stress_label,
+        },
+        "inconsistency": {
+            "score": incons_score,   # 0〜100
+            "color": incons_color,
+            "label": incons_label,
+        },
+        "future": {
+            "score": future_score,   # 0〜100
+            "color": future_color,
+            "label": future_label,
+        },
+    }
